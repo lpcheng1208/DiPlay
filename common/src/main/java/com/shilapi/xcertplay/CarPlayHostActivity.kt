@@ -8,6 +8,7 @@ import android.content.res.ColorStateList
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Color
+import android.graphics.Matrix
 import android.graphics.SurfaceTexture
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
@@ -55,10 +56,16 @@ import com.shilapi.xcertplay.airplay.CarPlayUiScale
 import com.shilapi.xcertplay.airplay.AirPlayDisplayConfig
 import com.shilapi.xcertplay.airplay.AirPlayIdentity
 import com.shilapi.xcertplay.airplay.AirPlayIcon
+import com.shilapi.xcertplay.airplay.CarPlayClusterDisplay
 import com.shilapi.xcertplay.airplay.AirPlaySafeArea
 import com.shilapi.xcertplay.airplay.AirPlaySession
 import com.shilapi.xcertplay.airplay.AirPlaySessionListener
+import com.shilapi.xcertplay.airplay.CarPlayDisplayChangePolicy
+import com.shilapi.xcertplay.airplay.CarPlayFixedResolution
 import com.shilapi.xcertplay.airplay.CarPlayMediaEngine
+import com.shilapi.xcertplay.airplay.ContentRect
+import com.shilapi.xcertplay.airplay.DisplayChangeAction
+import com.shilapi.xcertplay.airplay.PixelSize
 import com.shilapi.xcertplay.airplay.SafeAreaRect
 import com.shilapi.xcertplay.host.R
 import com.shilapi.xcertplay.location.AndroidCarPlayLocationProvider
@@ -259,9 +266,22 @@ class CarPlayHostActivity : ComponentActivity() {
     private var controller: CarPlayController? = null
     private var currentSurface: Surface? = null
     private var currentSurfaceTexture: SurfaceTexture? = null
+    private var clusterPresentation: ClusterMapPresentation? = null
+    private var clusterSurface: Surface? = null
+    private var clusterMonitor: DiLink51ClusterMonitor? = null
+    private var detectedCluster = ClusterActivityState.Snapshot(null, false)
+    // Keep one surface per layer alive, including while its map card is hidden.
+    private val clusterLayers = mutableMapOf<Boolean, ClusterMapPresentation>()
     private var activeDisplaySize: DisplaySize? = null
     private var pendingDisplaySize: DisplaySize? = null
+    // Fixed-resolution session: negotiated once from sessionBase and kept while the view resizes.
+    private var sessionBase: PixelSize? = null
+    private var sessionCanvas: PixelSize? = null
+    private var sessionLayout: String? = null
+    private var touchOutsideContent = false
     private var displayScaleTenths = CarPlayDisplayScale.DEFAULT_TENTHS
+    // Step actually negotiated by the last createAirPlayConfig(); Native after a decoder fallback.
+    private var effectiveDisplayScaleTenths = CarPlayDisplayScale.DEFAULT_TENTHS
     private var uiScalePercent = CarPlayUiScale.DEFAULT
     private var displayDiagnosticAttempt: String? = null
     private var hevcEnabled = true
@@ -309,7 +329,8 @@ class CarPlayHostActivity : ComponentActivity() {
     private var activeAirPlaySession: AirPlaySession? = null
     private val activeScreenStreamTypes = mutableSetOf<Int>()
     private var handshakeResetInProgress = false
-    private var startAfterHandshakeReset = false
+    // Set when the session ends or fails while the settings overlay suppresses reconnects.
+    private var reconnectAfterSettings = false
     private var restartGeneration = 0
     private var reconnectScheduled = false
     private var sessionLog: SessionLogFile? = null
@@ -347,10 +368,13 @@ class CarPlayHostActivity : ComponentActivity() {
             }
             appendLog(if (existing === surface) "Texture surface reused" else "Texture surface created")
             attachSurface(surface)
+            updateVideoLayout(width, height)
             scheduleDisplaySize(width, height)
         }
 
         override fun onSurfaceTextureSizeChanged(texture: SurfaceTexture, width: Int, height: Int) {
+            // Re-fit immediately; the debounced size change never renegotiates a running session.
+            updateVideoLayout(width, height)
             scheduleDisplaySize(width, height)
         }
 
@@ -421,7 +445,8 @@ class CarPlayHostActivity : ComponentActivity() {
 
     private fun loadPersistedSettings() {
         displayScaleTenths = AirPlayPersistence.loadDisplayScaleTenths(this)
-        uiScalePercent = AirPlayPersistence.loadUiScalePercent(this)
+        // Size is now chosen only through CarPlaySize; ignore the canvas scale older builds stored.
+        uiScalePercent = CarPlayUiScale.DEFAULT
         hevcEnabled = AirPlayPersistence.loadHevcEnabled(this)
         hevcSoftwareDecoderEnabled =
             Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q &&
@@ -553,8 +578,138 @@ class CarPlayHostActivity : ComponentActivity() {
             requestLocationPermission()
         }
         wirelessPermissionsReady = !wirelessEnabled || hasRequiredWirelessPermissions()
+        if (DiLink51ClusterLayout.automatic(this) && clusterMonitor == null) {
+            clusterMonitor = DiLink51ClusterMonitor(this, ::onClusterActivityState).also { it.start() }
+        } else if (!DiLink51ClusterLayout.automatic(this)) {
+            clusterMonitor?.stop()
+            clusterMonitor = null
+        }
+        ensureClusterPresentation()
         maybeStartCarPlay()
         applyFullscreenMode()
+    }
+
+    // Experimental: the CarPlay instrument-cluster stream on the BYD cluster projection display.
+    private fun effectiveClusterTheme(): DiLink51ClusterLayout.Theme =
+        if (DiLink51ClusterLayout.automatic(this)) detectedCluster.theme ?: DiLink51ClusterLayout.theme(this)
+        else DiLink51ClusterLayout.theme(this)
+
+    private fun onClusterActivityState(state: ClusterActivityState.Snapshot) {
+        if (state != detectedCluster) appendLog("Cluster map: detected theme=${state.theme} mapVisible=${state.mapVisible}")
+        detectedCluster = state
+        if (!AirPlayPersistence.loadClusterMapEnabled(this)) { dismissClusterPresentation(); return }
+        ensureClusterPresentation()
+    }
+
+    private fun ensureClusterPresentation() {
+        if (!AirPlayPersistence.loadClusterMapEnabled(this)) {
+            dismissClusterPresentation()
+            return
+        }
+        val theme = effectiveClusterTheme()
+        if (DiLink51ClusterLayout.supported()) {
+            ensureDiLink51ClusterPresentation(theme)
+            return
+        }
+        if (clusterPresentation != null) return
+        val display = ClusterMapPresentation.findDisplay(this, theme) ?: run {
+            appendLog("Cluster map: no cluster projection display among ${ClusterMapPresentation.describeDisplays(this)}")
+            return
+        }
+        val presentation = ClusterMapPresentation(this, display, theme) { surface -> runOnUiThread { onClusterSurface(surface) } }
+        // The system dismisses a presentation when its display goes away; allow a new one on resume.
+        presentation.setOnDismissListener { if (clusterPresentation === presentation) clusterPresentation = null }
+        try {
+            presentation.show()
+            clusterPresentation = presentation
+            presentation.setStreamActive(SCREEN_TYPE_ALT in activeScreenStreamTypes)
+            Log.i(ClusterMapPresentation.TAG, "cluster presentation shown display=${display.displayId} name=${display.name}")
+            appendLog("Cluster map: presentation shown display=${display.displayId}")
+        } catch (error: RuntimeException) {
+            Log.w(ClusterMapPresentation.TAG, "cluster presentation failed", error)
+            appendLog("Cluster map: presentation failed ${error.javaClass.simpleName}")
+        }
+    }
+
+    private fun ensureDiLink51ClusterPresentation(theme: DiLink51ClusterLayout.Theme) {
+        val fullMap = theme == DiLink51ClusterLayout.Theme.MAP
+        val visible = !DiLink51ClusterLayout.automatic(this) || detectedCluster.mapVisible
+        clusterLayers.filterKeys { it != fullMap }.values.forEach { it.setMapVisible(false) }
+        var target = clusterLayers[fullMap]
+        if (target == null) {
+            val display = ClusterMapPresentation.findDisplay(this, theme) ?: return
+            lateinit var presentation: ClusterMapPresentation
+            presentation = ClusterMapPresentation(this, display, theme) { surface ->
+                runOnUiThread {
+                    if (clusterPresentation === presentation) onClusterSurface(surface)
+                }
+            }
+            presentation.setOnDismissListener {
+                if (clusterLayers[fullMap] === presentation) clusterLayers.remove(fullMap)
+                if (clusterPresentation === presentation) clusterPresentation = null
+            }
+            try {
+                presentation.setMapVisible(false)
+                clusterPresentation = presentation
+                clusterLayers[fullMap] = presentation
+                presentation.show()
+                appendLog("Cluster map: retained layer display=${display.displayId} fullMap=$fullMap")
+                target = presentation
+            } catch (error: RuntimeException) {
+                clusterLayers.remove(fullMap)
+                clusterPresentation = null
+                appendLog("Cluster map: presentation failed ${error.javaClass.simpleName}")
+                return
+            }
+        }
+        clusterPresentation = target
+        target.outputSurface?.let(::onClusterSurface)
+        target.setStreamActive(SCREEN_TYPE_ALT in activeScreenStreamTypes)
+        target.setMapVisible(visible)
+    }
+
+    private fun dismissClusterPresentation() {
+        val presentations = (clusterLayers.values + listOfNotNull(clusterPresentation)).distinct()
+        clusterLayers.clear()
+        clusterPresentation = null
+        clusterSurface?.let { sink?.clearSurface(SCREEN_TYPE_ALT, it) }
+        clusterSurface = null
+        presentations.forEach { runCatching { it.dismiss() } }
+    }
+
+    private fun onClusterSurface(surface: Surface?) {
+        if (clusterSurface === surface) return
+        // A direct handoff lets MediaCodec.setOutputSurface preserve its reference frames.
+        // Clearing first would destroy the decoder and can leave stream 111 waiting for an IDR.
+        if (!DiLink51ClusterLayout.supported() || surface == null) {
+            clusterSurface?.let { old -> sink?.clearSurface(SCREEN_TYPE_ALT, old) }
+        }
+        clusterSurface = surface
+        // Never fall back to the main surface: two decoders must not draw into one Surface.
+        if (surface != null) sink?.setSurface(SCREEN_TYPE_ALT, surface)
+    }
+
+    private fun clusterDisplayConfig(): AirPlayDisplayConfig? {
+        if (!AirPlayPersistence.loadClusterMapEnabled(this)) return null
+        val theme = effectiveClusterTheme()
+        val display = ClusterMapPresentation.findDisplay(this, theme) ?: return null
+        val size = ClusterMapPresentation.sizeOf(display)
+        if (size.x <= 0 || size.y <= 0) return null
+        if (DiLink51ClusterLayout.supported()) {
+            val plan = DiLink51ClusterLayout.plan(size.x, size.y, theme) ?: return null
+            return DiLink51ClusterLayout.streamConfig().also {
+                appendLog("Cluster map: fixed 1920x720 stream; layout=$theme viewport=$plan")
+            }
+        }
+        return CarPlayClusterDisplay.config(
+            size.x,
+            size.y,
+            AirPlayPersistence.loadClusterMapScalePercent(this),
+            AirPlayPersistence.loadClusterMarkerHorizontalStep(this),
+            AirPlayPersistence.loadClusterMarkerVerticalStep(this),
+        ).also {
+            appendLog("Cluster map: requesting ${it.widthPixels}x${it.heightPixels} on ${size.x}x${size.y} safeArea=${it.safeArea}")
+        }
     }
 
     override fun onWindowFocusChanged(hasFocus: Boolean) {
@@ -584,6 +739,8 @@ class CarPlayHostActivity : ComponentActivity() {
     }
 
     override fun onDestroy() {
+        clusterMonitor?.stop()
+        dismissClusterPresentation()
         mainHandler.removeCallbacks(applyDisplaySize)
         mainHandler.removeCallbacks(expireOldLogLines)
         currentSurface?.let { surface ->
@@ -600,7 +757,7 @@ class CarPlayHostActivity : ComponentActivity() {
     }
 
     private fun buildContentView(): View {
-        val root = FrameLayout(this).apply { setBackgroundColor(Color.rgb(12, 17, 27)) }
+        val root = FrameLayout(this).apply { setBackgroundColor(Color.BLACK) }
         val video = TextureView(this).apply {
             isOpaque = false
             surfaceTextureListener = textureListener
@@ -650,10 +807,16 @@ class CarPlayHostActivity : ComponentActivity() {
             setOnClickListener { showDiPlayHome() }
         }, LinearLayout.LayoutParams(dp(300), dp(64)))
         panel.addView(TextView(this).apply {
-            text = "In CarPlay, swipe down with three fingers to open DiPlay settings."
+            text = "In CarPlay, swipe down with three fingers to open CarPlay settings."
             textSize = 13f; gravity = Gravity.CENTER; setTextColor(Color.rgb(168, 182, 202)); setPadding(0, dp(20), 0, 0)
         })
         root.addView(panel, FrameLayout.LayoutParams(-1, -1))
+        val settings = buildSettingsMenu().apply { visibility = View.GONE }
+        val editor = buildSafeAreaEditor().apply { visibility = View.GONE }
+        root.addView(settings, FrameLayout.LayoutParams(-1, -1))
+        root.addView(editor, FrameLayout.LayoutParams(-1, -1))
+        settingsMenu = settings
+        safeAreaEditor = editor
         videoView = video
         gestureOverlay = gestureLayer
         stageStatusView = stage
@@ -937,7 +1100,7 @@ class CarPlayHostActivity : ComponentActivity() {
             LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f),
         )
         range.addView(
-            menuText("1.0x", 15f, MENU_SECONDARY),
+            menuText(CarPlayDisplayScale.label(CarPlayDisplayScale.MAX_TENTHS), 15f, MENU_SECONDARY),
             LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.WRAP_CONTENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT,
@@ -2115,8 +2278,7 @@ class CarPlayHostActivity : ComponentActivity() {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                 add(WirelessHotspotMode.WIFI_P2P to "Wi-Fi P2P (5 GHz)")
             }
-            add(WirelessHotspotMode.LOCAL_ONLY_HOTSPOT to "LocalOnlyHotspot")
-            add(WirelessHotspotMode.MANUAL to "Manual hotspot")
+            add(WirelessHotspotMode.MANUAL to "Built-in car hotspot")
         }
         var selectedId = View.NO_ID
         for ((mode, label) in modes) {
@@ -2443,7 +2605,9 @@ class CarPlayHostActivity : ComponentActivity() {
 
     private fun updateResolutionMenu() {
         resolutionValueView?.text = CarPlayDisplayScale.label(displayScaleTenths)
-        val native = activeDisplaySize ?: currentActivitySize()
+        val native = (activeDisplaySize ?: currentActivitySize())
+            ?.let { resolveResolutionBase(it) }
+            ?.let { DisplaySize(it.width, it.height) }
         val resolution = if (native == null) {
             "Handshake resolution: waiting for display"
         } else {
@@ -2554,7 +2718,33 @@ class CarPlayHostActivity : ComponentActivity() {
             heightPhysicalMm = physical.heightMm,
             fps = fps,
         )
-        val resolutionDisplay = CarPlayDisplayScale.apply(baseDisplay, displayScaleTenths)
+        var resolutionDisplay = CarPlayDisplayScale.apply(baseDisplay, displayScaleTenths)
+        effectiveDisplayScaleTenths = displayScaleTenths
+        if (displayScaleTenths > CarPlayDisplayScale.NATIVE_TENTHS) {
+            // Supersampled steps must fit the 4K bound and the head unit's decoder.
+            val upscaled = resolutionDisplay.widthPixels > baseDisplay.widthPixels
+            val upscaleSupport = if (upscaled) {
+                largerCanvasSupport(resolutionDisplay)
+            } else {
+                CanvasSupport(false, "canvas_4k_limit", "Decoder capability check skipped: canvas exceeds 4K limit")
+            }
+            appendLog(upscaleSupport.details)
+            if (!upscaleSupport.supported) {
+                appendLog(
+                    "Upscaled CarPlay resolution ${CarPlayDisplayScale.label(displayScaleTenths)} " +
+                        "${resolutionDisplay.widthPixels}x${resolutionDisplay.heightPixels} unavailable " +
+                        "reason=${upscaleSupport.reason}; using Native " +
+                        "${baseDisplay.widthPixels}x${baseDisplay.heightPixels}",
+                )
+                resolutionDisplay = baseDisplay
+                effectiveDisplayScaleTenths = CarPlayDisplayScale.NATIVE_TENTHS
+                runOnUiThread {
+                    android.widget.Toast.makeText(this,
+                        "This head unit cannot decode this resolution. Using Native.",
+                        android.widget.Toast.LENGTH_LONG).show()
+                }
+            }
+        }
         val requestedPercent = uiScalePercent
         var scaledDisplay = CarPlayUiScale.apply(resolutionDisplay, uiScalePercent)
         val candidate = scaledDisplay
@@ -2604,6 +2794,7 @@ class CarPlayHostActivity : ComponentActivity() {
             btMac = DiPlayBluetooth.localAddress(this) ?: DiPlayBootstrap.deviceId(airPlayIdentity),
             sourceVersion = "950.7.1",
             main = display,
+            cluster = clusterDisplayConfig(),
             rightHandDrive = rightHandDrive,
             hevc = hevcEnabled,
             microphone = microphoneAvailable,
@@ -2640,7 +2831,8 @@ class CarPlayHostActivity : ComponentActivity() {
     }
 
     private fun defaultAirPlayIconBytes(): ByteArray =
-        resources.openRawResource(R.drawable.ic_carplay).use { it.readBytes() }
+        // Shown in CarPlay's app list as the "back to the car" button.
+        resources.openRawResource(R.raw.ic_car_home).use { it.readBytes() }
 
     private fun updateAirPlayIconPreview() {
         val preview = iconPreviewView ?: return
@@ -2763,16 +2955,24 @@ class CarPlayHostActivity : ComponentActivity() {
         videoWidth: Int,
         videoHeight: Int,
         controllerGeneration: Int,
-    ): AndroidMediaSink = AndroidMediaSink(
-        surface = null,
-        videoWidth = videoWidth,
-        videoHeight = videoHeight,
-        preferSoftwareHevcDecoder = hevcSoftwareDecoderEnabled,
-        advancedAudioChannelMapping = advancedAudioChannelMapping,
-        onScreenStreamActiveChanged = { type, active ->
-            onScreenStreamStateChanged(controllerGeneration, type, active)
-        },
-    )
+    ): AndroidMediaSink {
+        // Capture this session's log: late decoder shutdown must not write into a new session.
+        val diagnosticLog = sessionLog
+        return AndroidMediaSink(
+            surface = null,
+            videoWidth = videoWidth,
+            videoHeight = videoHeight,
+            preferSoftwareHevcDecoder = hevcSoftwareDecoderEnabled,
+            advancedAudioChannelMapping = advancedAudioChannelMapping,
+            onScreenStreamActiveChanged = { type, active ->
+                onScreenStreamStateChanged(controllerGeneration, type, active)
+            },
+            mediaBufferMillis = AirPlayPersistence.loadMediaBufferMillis(this),
+            onAudioDiagnostic = { message ->
+                diagnosticLog?.append(formattedLogLine(message, System.currentTimeMillis()))
+            },
+        )
+    }
 
     private fun createMediaEngine(sink: AndroidMediaSink): CarPlayMediaEngine =
         CarPlayMediaEngine(
@@ -2801,7 +3001,9 @@ class CarPlayHostActivity : ComponentActivity() {
                 runOnUiThread {
                     if (activeAirPlaySession === session) activeAirPlaySession = null
                     CarPlayBackgroundSession.active = false
-                    if (menuOpen || controllerGeneration != restartGeneration) {
+                    if (controllerGeneration != restartGeneration) return@runOnUiThread
+                    if (menuOpen) {
+                        reconnectAfterSettings = true
                         return@runOnUiThread
                     }
                     activeScreenStreamTypes.clear()
@@ -2813,7 +3015,9 @@ class CarPlayHostActivity : ComponentActivity() {
 
             override fun onTransportError(message: String) {
                 runOnUiThread {
-                    if (menuOpen || controllerGeneration != restartGeneration) {
+                    if (controllerGeneration != restartGeneration) return@runOnUiThread
+                    if (menuOpen) {
+                        reconnectAfterSettings = true
                         return@runOnUiThread
                     }
                     activeScreenStreamTypes.clear()
@@ -2843,6 +3047,9 @@ class CarPlayHostActivity : ComponentActivity() {
     private fun createStatusReporter(
         controllerGeneration: Int,
     ): (CarPlayStatus) -> Unit = { status ->
+        if (menuOpen && controllerGeneration == restartGeneration && status is CarPlayStatus.Failed) {
+            reconnectAfterSettings = true
+        }
         if (!menuOpen && controllerGeneration == restartGeneration) {
             updateHotspotStatus(status)
             val description = status.describe()
@@ -2868,7 +3075,10 @@ class CarPlayHostActivity : ComponentActivity() {
         displayDiagnosticAttempt = DisplayDiagnosticSnapshot.currentAttempt(this)
         controller = snapshot.controller
         sink = snapshot.sink
-        CarPlayBackgroundSession.store(snapshot.controller, snapshot.sink, snapshot.width, snapshot.height, this) { completion ->
+        CarPlayBackgroundSession.store(
+            snapshot.controller, snapshot.sink, snapshot.width, snapshot.height, this,
+            canvas = snapshot.canvas, layout = snapshot.layout,
+        ) { completion ->
             runOnUiThread {
                 shutdown(false, "DiPlay disconnect", completion)
                 finish()
@@ -2876,7 +3086,11 @@ class CarPlayHostActivity : ComponentActivity() {
         }
         if (snapshot.width > 0 && snapshot.height > 0) {
             activeDisplaySize = DisplaySize(snapshot.width, snapshot.height)
+            sessionBase = PixelSize(snapshot.width, snapshot.height)
         }
+        sessionCanvas = snapshot.canvas
+        sessionLayout = snapshot.layout
+        videoView?.let { updateVideoLayout(it.width, it.height) }
         val generation = restartGeneration
         snapshot.controller.attachUi(
             createSessionListener(generation),
@@ -2910,7 +3124,16 @@ class CarPlayHostActivity : ComponentActivity() {
         if (shuttingDown.get() || menuOpen || handshakeResetInProgress || controller != null) return
         val controllerGeneration = restartGeneration
         val config = createRuntimeConfig()
-        val airPlayConfig = createAirPlayConfig(size)
+        // The tier is applied to a stable base, never to a transient (surround-view) size.
+        val base = resolveResolutionBase(size)
+        val baseSize = DisplaySize(base.width, base.height)
+        val airPlayConfig = createAirPlayConfig(baseSize)
+        val fixed = CarPlayFixedResolution.negotiated(base, effectiveDisplayScaleTenths)
+        AirPlayPersistence.saveFixedResolution(this, base, fixed)
+        sessionBase = base
+        sessionCanvas = PixelSize(airPlayConfig.main.widthPixels, airPlayConfig.main.heightPixels)
+        sessionLayout = barLayout()
+        videoView?.let { updateVideoLayout(it.width, it.height) }
         val locationProvider: Iap2LocationProvider? =
             if (config.locationReportingEnabled) {
                 AndroidCarPlayLocationProvider(this)
@@ -2918,7 +3141,8 @@ class CarPlayHostActivity : ComponentActivity() {
                 null
             }
         appendLog(
-            "Starting CarPlay controller at ${size.width}x${size.height} -> " +
+            "Starting CarPlay controller at ${size.width}x${size.height} " +
+                "fixed resolution base=$base -> $fixed canvas=$sessionCanvas -> " +
                 "${airPlayConfig.main.widthPixels}x${airPlayConfig.main.heightPixels} " +
                 "(${CarPlayDisplayScale.label(displayScaleTenths)}) " +
                 "physical=${airPlayConfig.main.widthPhysicalMm}x" +
@@ -2931,7 +3155,7 @@ class CarPlayHostActivity : ComponentActivity() {
         )
         Log.i(
             TAG,
-            "starting controller display=${size.width}x${size.height} " +
+            "starting controller display=${size.width}x${size.height} base=$base fixed=$fixed " +
                 "negotiated=${airPlayConfig.main.widthPixels}x${airPlayConfig.main.heightPixels} " +
                 "scale=${CarPlayDisplayScale.label(displayScaleTenths)} " +
                 "hevc=${airPlayConfig.hevc} " +
@@ -2947,6 +3171,7 @@ class CarPlayHostActivity : ComponentActivity() {
         )
         sink = renderer
         currentSurface?.let(::attachSurface)
+        clusterSurface?.let { renderer.setSurface(SCREEN_TYPE_ALT, it) }
         val media = createMediaEngine(renderer)
         val pairings = AirPlayPersistence.loadPairings(this) { id, key ->
             AirPlayPersistence.savePairing(this, id, key)
@@ -2966,7 +3191,10 @@ class CarPlayHostActivity : ComponentActivity() {
             locationProvider = locationProvider,
         )
         controller = next
-        CarPlayBackgroundSession.store(next, renderer, size.width, size.height, this) { completion ->
+        CarPlayBackgroundSession.store(
+            next, renderer, base.width, base.height, this,
+            canvas = sessionCanvas, layout = sessionLayout,
+        ) { completion ->
             runOnUiThread {
                 shutdown(terminateProcess = false, reason = "DiPlay disconnect", completion = completion)
                 finish()
@@ -3017,21 +3245,77 @@ class CarPlayHostActivity : ComponentActivity() {
         val previous = activeDisplaySize
         activeDisplaySize = size
         recordDetectedMaximum(size)
+        recordResolutionBase(size)
         updateResolutionMenu()
-        if (previous == null) {
-            appendLog("Display detected: ${size.width}x${size.height}")
-            maybeStartCarPlay()
-        } else if (menuOpen || handshakeResetInProgress) {
-            appendLog(
-                "Display updated while handshake is reset: " +
-                    "${previous.width}x${previous.height} -> ${size.width}x${size.height}",
+        val change = previous?.let { "${it.width}x${it.height} -> ${size.width}x${size.height}" }
+        when (
+            CarPlayDisplayChangePolicy.decide(
+                previous = previous?.toPixelSize(),
+                next = size.toPixelSize(),
+                resetInProgress = menuOpen || handshakeResetInProgress,
+                sessionBase = sessionBase,
+                sessionLayout = sessionLayout,
+                currentLayout = barLayout(),
             )
-        } else {
-            restartCarPlay(
-                "Display changed ${previous.width}x${previous.height} -> ${size.width}x${size.height}",
-            )
+        ) {
+            DisplayChangeAction.START -> {
+                appendLog("Display detected: ${size.width}x${size.height}")
+                maybeStartCarPlay()
+            }
+            DisplayChangeAction.RECORD_ONLY ->
+                appendLog("Display updated while handshake is reset: $change")
+            DisplayChangeAction.KEEP_SESSION -> {
+                // Surround view and similar overlays only resize the visible area; the iPhone
+                // keeps rendering the fixed canvas, letterboxed into the new view.
+                val message = "Display changed $change; keeping fixed-resolution CarPlay session " +
+                    "canvas=${sessionCanvas ?: "unknown"}"
+                appendLog(message)
+                Log.i(TAG, message)
+                videoView?.let { updateVideoLayout(it.width, it.height) }
+            }
+            DisplayChangeAction.RENEGOTIATE -> restartCarPlay("Display changed $change")
         }
     }
+
+    /** Bar visibility decides the usable area, so each layout keeps its own resolution base. */
+    private fun barLayout(): String =
+        (if (hideTopBar) "top-hidden" else "top-shown") + "_" +
+            (if (hideBottomBar) "bottom-hidden" else "bottom-shown")
+
+    private fun resolutionBaseKey(size: DisplaySize): String =
+        barLayout() + "_" + (if (size.width >= size.height) "landscape" else "portrait")
+
+    private fun recordResolutionBase(size: DisplaySize) {
+        val key = resolutionBaseKey(size)
+        val stored = AirPlayPersistence.loadResolutionBase(this, key)
+        val next = CarPlayFixedResolution.base(size.toPixelSize(), stored)
+        if (next != stored) AirPlayPersistence.saveResolutionBase(this, key, next)
+    }
+
+    /** Stable base for this session: the largest size seen for the current layout. */
+    private fun resolveResolutionBase(size: DisplaySize): PixelSize =
+        CarPlayFixedResolution.base(
+            size.toPixelSize(),
+            AirPlayPersistence.loadResolutionBase(this, resolutionBaseKey(size)),
+        )
+
+    private fun contentRect(viewWidth: Int, viewHeight: Int): ContentRect =
+        ContentRect.fit(sessionCanvas, viewWidth, viewHeight)
+
+    /** Draws the fixed canvas without distortion; the view itself stays full size. */
+    private fun updateVideoLayout(viewWidth: Int, viewHeight: Int) {
+        val view = videoView ?: return
+        if (viewWidth <= 0 || viewHeight <= 0) return
+        val rect = contentRect(viewWidth, viewHeight)
+        val matrix = Matrix()
+        if (!rect.isFullView) {
+            matrix.setScale(rect.width / viewWidth, rect.height / viewHeight)
+            matrix.postTranslate(rect.left, rect.top)
+        }
+        view.setTransform(matrix)
+    }
+
+    private fun DisplaySize.toPixelSize(): PixelSize = PixelSize(width, height)
 
     private fun recordDetectedMaximum(size: DisplaySize) {
         val width = maxOf(maximumDetectedWidthPixels, size.width)
@@ -3082,6 +3366,10 @@ class CarPlayHostActivity : ComponentActivity() {
         mainHandler.postDelayed(
             {
                 reconnectScheduled = false
+                if (menuOpen && generation == restartGeneration) {
+                    reconnectAfterSettings = true
+                    return@postDelayed
+                }
                 if (
                     shuttingDown.get() ||
                     menuOpen ||
@@ -3112,6 +3400,7 @@ class CarPlayHostActivity : ComponentActivity() {
         CarPlayBackgroundSession.clear(oldController, keepOwner = true)
         controller = null
         sink = null
+        clearFixedResolutionSession()
         teardownExecutor.execute {
             oldController?.close()
             oldController?.awaitClosed(CONTROLLER_CLOSE_TIMEOUT_MILLIS)
@@ -3125,13 +3414,39 @@ class CarPlayHostActivity : ComponentActivity() {
         }
     }
 
+    private fun clearFixedResolutionSession() {
+        sessionBase = null
+        sessionCanvas = null
+        sessionLayout = null
+    }
+
     private fun showDiPlayHome(page: String = "home") {
         controller?.sendTouch(emptyList())
         startActivity(Intent(this, DiPlayActivity::class.java)
             .putExtra("page", page).addFlags(Intent.FLAG_ACTIVITY_REORDER_TO_FRONT))
     }
 
-    private fun openSettingsMenu() = showDiPlayHome("settings")
+    /**
+     * Opens the in-session settings overlay (three-finger swipe down). CarPlay keeps running
+     * underneath; only "Save and reconnect" renegotiates, Cancel leaves the session untouched.
+     */
+    private fun openSettingsMenu() {
+        val menu = settingsMenu ?: return
+        if (menuOpen || shuttingDown.get()) return
+        controller?.sendTouch(emptyList())
+        settingsBaseline = captureSettingsBaseline()
+        menuOpen = true
+        reconnectAfterSettings = false
+        gestureOverlay?.visibility = View.GONE
+        menu.visibility = View.VISIBLE
+        syncMfiSettingsControls()
+        updateManualHotspotFields()
+        updateAirPlayIconPreview()
+        updateSafeAreaSummary()
+        updateHotspotStatusBlock()
+        updateResolutionMenu()
+        appendLog("Settings opened; CarPlay session kept running")
+    }
 
     private fun saveSettingsAndReconnect() {
         if (!menuOpen) return
@@ -3139,33 +3454,84 @@ class CarPlayHostActivity : ComponentActivity() {
         if (!validateManualHotspotSettings()) return
         persistMenuSettings()
         settingsBaseline = null
-        finishSettingsMenu("Settings saved")
+        finishSettingsMenu("Settings saved", renegotiate = true)
     }
 
     private fun cancelSettingsEdits() {
         if (!menuOpen) return
         restoreSettingsBaseline()
-        finishSettingsMenu("Settings changes discarded")
+        finishSettingsMenu("Settings changes discarded", renegotiate = false)
     }
 
-    private fun finishSettingsMenu(prefix: String) {
+    private fun finishSettingsMenu(prefix: String, renegotiate: Boolean) {
         if (!menuOpen) return
+        closeSafeAreaEditor()
         menuOpen = false
         settingsMenu?.visibility = View.GONE
         gestureOverlay?.visibility = View.VISIBLE
         updateDebugOverlays()
-        logLines.clear()
-        appendLog(
-            "$prefix; starting a fresh handshake at " +
-                "${CarPlayDisplayScale.label(displayScaleTenths)} with " +
-                (if (hevcEnabled) "HEVC (H.265)" else "H.264") +
-                ", MFI ${mfiTargetLabel(mfiTarget)}" +
-                ", Wi-Fi session ${hotspotModeLabel(wirelessHotspotMode)}",
-        )
-        if (handshakeResetInProgress) {
-            startAfterHandshakeReset = true
+        val lost = reconnectAfterSettings
+        reconnectAfterSettings = false
+        when {
+            // An in-flight rebuild reads the current fields when it starts the new controller.
+            handshakeResetInProgress -> appendLog("$prefix; applying with the pending handshake reset")
+            renegotiate -> renegotiateAfterSettings(
+                "$prefix; starting a fresh handshake at " +
+                    "${CarPlayDisplayScale.label(displayScaleTenths)} with " +
+                    (if (hevcEnabled) "HEVC (H.265)" else "H.264") +
+                    ", MFI ${mfiTargetLabel(mfiTarget)}" +
+                    ", Wi-Fi session ${hotspotModeLabel(wirelessHotspotMode)}",
+            )
+            controller == null -> {
+                appendLog("$prefix; starting CarPlay")
+                ensureStartupPrerequisites()
+            }
+            lost -> restartCarPlay("$prefix; reconnecting a session lost while settings were open")
+            else -> appendLog("$prefix; CarPlay session unchanged")
+        }
+    }
+
+    /**
+     * Re-runs the startup prerequisite chain, which ends in [maybeStartCarPlay]. An Activity that
+     * adopted a background session skipped it in onCreate, leaving vpnReady and the microphone
+     * flag unset, so a bare maybeStartCarPlay() after a settings reconnect would never start.
+     */
+    private fun ensureStartupPrerequisites() {
+        if (microphonePermissionResolved) {
+            requestStartupPrerequisites()
         } else {
-            maybeStartCarPlay()
+            microphonePermission.launch(Manifest.permission.RECORD_AUDIO)
+        }
+    }
+
+    /** Tears the session down and restarts through [ensureStartupPrerequisites] with new settings. */
+    private fun renegotiateAfterSettings(reason: String) {
+        appendLog(reason)
+        setConnectionStage("Reconnecting after settings")
+        val generation = ++restartGeneration
+        handshakeResetInProgress = true
+        controller?.sendTouch(emptyList())
+        val oldController = controller
+        val oldSink = sink
+        CarPlayBackgroundSession.clear(oldController, keepOwner = true)
+        controller = null
+        sink = null
+        activeAirPlaySession = null
+        clearFixedResolutionSession()
+        activeScreenStreamTypes.clear()
+        updateDebugOverlays()
+        teardownExecutor.execute {
+            try {
+                oldController?.close()
+                oldController?.awaitClosed(CONTROLLER_CLOSE_TIMEOUT_MILLIS)
+            } finally {
+                oldSink?.close()
+                runOnUiThread {
+                    if (shuttingDown.get() || generation != restartGeneration) return@runOnUiThread
+                    handshakeResetInProgress = false
+                    ensureStartupPrerequisites()
+                }
+            }
         }
     }
 
@@ -3185,6 +3551,7 @@ class CarPlayHostActivity : ComponentActivity() {
         CarPlayBackgroundSession.clear(oldController)
         controller = null
         sink = null
+        clearFixedResolutionSession()
         Log.i(TAG, "shutdown reason=$reason terminateProcess=$terminateProcess")
         teardownExecutor.execute {
             oldController?.close()
@@ -3204,7 +3571,11 @@ class CarPlayHostActivity : ComponentActivity() {
 
     private fun attachSurface(surface: Surface) {
         sink?.setSurface(SCREEN_TYPE_MAIN, surface)
-        sink?.setSurface(SCREEN_TYPE_ALT, surface)
+        if (AirPlayPersistence.loadClusterMapEnabled(this)) {
+            clusterSurface?.let { sink?.setSurface(SCREEN_TYPE_ALT, it) }
+        } else {
+            sink?.setSurface(SCREEN_TYPE_ALT, surface)
+        }
     }
 
     private fun onHostTouch(view: View, event: MotionEvent): Boolean {
@@ -3256,7 +3627,20 @@ class CarPlayHostActivity : ComponentActivity() {
             return true
         }
 
-        val contacts = CarPlayTouchMapper.contacts(event, view.width, view.height)
+        val content = contentRect(view.width, view.height)
+        if (event.actionMasked == MotionEvent.ACTION_DOWN) {
+            touchOutsideContent = !content.contains(event.x, event.y)
+        }
+        if (touchOutsideContent) {
+            // A gesture that starts in a letterbox bar never reaches CarPlay.
+            if (event.actionMasked == MotionEvent.ACTION_UP ||
+                event.actionMasked == MotionEvent.ACTION_CANCEL
+            ) {
+                touchOutsideContent = false
+            }
+            return true
+        }
+        val contacts = CarPlayTouchMapper.contacts(event, content)
         val queued = controller?.sendTouch(contacts) ?: false
         when (event.actionMasked) {
             MotionEvent.ACTION_DOWN,
@@ -3287,6 +3671,11 @@ class CarPlayHostActivity : ComponentActivity() {
                 activeScreenStreamTypes.add(type)
             } else {
                 activeScreenStreamTypes.remove(type)
+            }
+            if (type == SCREEN_TYPE_ALT) {
+                Log.i(ClusterMapPresentation.TAG, "cluster stream active=$active")
+                appendLog("Cluster map: stream active=$active")
+                clusterPresentation?.setStreamActive(active)
             }
             updateDebugOverlays()
         }
@@ -3488,33 +3877,49 @@ internal object CarPlayBackgroundSession {
         }
     }
 
+    /** [width] x [height] is the fixed-resolution base; [canvas] is the negotiated video size. */
     data class Snapshot(
         val controller: CarPlayController,
         val sink: AndroidMediaSink,
         val width: Int,
         val height: Int,
+        val canvas: PixelSize? = null,
+        val layout: String? = null,
     )
 
     private var controller: CarPlayController? = null
     private var sink: AndroidMediaSink? = null
     private var width = 0
     private var height = 0
+    private var canvas: PixelSize? = null
+    private var layout: String? = null
 
     @Synchronized
     fun snapshot(): Snapshot? {
         val currentController = controller ?: return null
         val currentSink = sink ?: return null
-        return Snapshot(currentController, currentSink, width, height)
+        return Snapshot(currentController, currentSink, width, height, canvas, layout)
     }
 
     @Synchronized
-    fun store(controller: CarPlayController, sink: AndroidMediaSink, width: Int, height: Int, owner: Any, stop: (() -> Unit) -> Unit) {
+    fun store(
+        controller: CarPlayController,
+        sink: AndroidMediaSink,
+        width: Int,
+        height: Int,
+        owner: Any,
+        canvas: PixelSize? = null,
+        layout: String? = null,
+        stop: (() -> Unit) -> Unit,
+    ) {
         this.stopAction = stop
         this.owner = owner
         this.controller = controller
         this.sink = sink
         this.width = width
         this.height = height
+        this.canvas = canvas
+        this.layout = layout
     }
 
     @Synchronized
@@ -3526,5 +3931,7 @@ internal object CarPlayBackgroundSession {
         active = false
         width = 0
         height = 0
+        canvas = null
+        layout = null
     }
 }

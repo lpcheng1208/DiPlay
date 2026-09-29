@@ -5,9 +5,11 @@ import android.os.Build
 import com.shilapi.xcertplay.airplay.AirPlayDisplaySettings
 import com.shilapi.xcertplay.airplay.AirPlayPhysicalSizeBasis
 import com.shilapi.xcertplay.airplay.CarPlayDisplayScale
+import com.shilapi.xcertplay.airplay.CarPlayClusterDisplay
 import com.shilapi.xcertplay.airplay.CarPlayUiScale
 import com.shilapi.xcertplay.airplay.AirPlayIdentity
 import com.shilapi.xcertplay.airplay.PairingStore
+import com.shilapi.xcertplay.airplay.PixelSize
 import com.shilapi.xcertplay.airplay.SafeAreaCodec
 import com.shilapi.xcertplay.airplay.SafeAreaRect
 import com.shilapi.xcertplay.orchestration.ManualHotspotBand
@@ -50,10 +52,20 @@ object AirPlayPersistence {
     private const val KEY_MODEL = "model"
     private const val KEY_OEM_LABEL = "oem_label"
     private const val KEY_FPS = "display_fps"
+    private const val KEY_MEDIA_BUFFER_MS = "media_buffer_ms"
+    private const val KEY_CLUSTER_MAP = "cluster_map_enabled"
+    private const val KEY_CLUSTER_MAP_SCALE = "cluster_map_scale_percent"
+    private const val KEY_CLUSTER_MARKER_X = "cluster_marker_horizontal_step"
+    private const val KEY_CLUSTER_MARKER_Y = "cluster_marker_vertical_step"
     private const val KEY_WIDTH_PHYSICAL_MM = "display_width_physical_mm"
     private const val KEY_PHYSICAL_SIZE_BASIS = "display_physical_size_basis"
     private const val KEY_MAX_DETECTED_WIDTH = "display_max_detected_width"
     private const val KEY_MAX_DETECTED_HEIGHT = "display_max_detected_height"
+    private const val KEY_RESOLUTION_BASE_PREFIX = "resolution_base_"
+    private const val KEY_FIXED_BASE_WIDTH = "fixed_resolution_base_width"
+    private const val KEY_FIXED_BASE_HEIGHT = "fixed_resolution_base_height"
+    private const val KEY_FIXED_WIDTH = "fixed_resolution_width"
+    private const val KEY_FIXED_HEIGHT = "fixed_resolution_height"
     private const val KEY_RIGHT_HAND_DRIVE = "right_hand_drive"
     private const val KEY_HIDE_TOP_BAR = "hide_top_bar"
     private const val KEY_HIDE_BOTTOM_BAR = "hide_bottom_bar"
@@ -69,7 +81,7 @@ object AirPlayPersistence {
 
     const val DEFAULT_MANUFACTURER = "DiPlay"
     const val DEFAULT_MODEL = "DiPlay"
-    const val DEFAULT_OEM_LABEL = ""
+    const val DEFAULT_OEM_LABEL = "BYD"
     const val DEFAULT_MFI_I2C_PATH = "/dev/i2c-1"
 
     fun loadDisplayScaleTenths(context: Context): Int {
@@ -182,22 +194,21 @@ object AirPlayPersistence {
     }
 
     fun loadWirelessHotspotMode(context: Context): WirelessHotspotMode {
-        val stored = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-            .getString(KEY_WIRELESS_HOTSPOT_MODE, null)
+        val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        val stored = prefs.getString(KEY_WIRELESS_HOTSPOT_MODE, null)
         val mode = WirelessHotspotMode.entries.firstOrNull { it.name == stored }
-            ?: WirelessHotspotMode.WIFI_P2P
-        return if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q &&
-            mode == WirelessHotspotMode.WIFI_P2P
-        ) {
-            WirelessHotspotMode.LOCAL_ONLY_HOTSPOT
-        } else {
-            mode
-        }
+            ?: WirelessHotspotMode.MANUAL
+        val supported = if (mode == WirelessHotspotMode.LOCAL_ONLY_HOTSPOT ||
+            (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q && mode == WirelessHotspotMode.WIFI_P2P)
+        ) WirelessHotspotMode.MANUAL else mode
+        if (stored != supported.name) saveWirelessHotspotMode(context, supported)
+        return supported
     }
 
     fun saveWirelessHotspotMode(context: Context, mode: WirelessHotspotMode) {
+        val supported = if (mode == WirelessHotspotMode.LOCAL_ONLY_HOTSPOT) WirelessHotspotMode.MANUAL else mode
         context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
-            .putString(KEY_WIRELESS_HOTSPOT_MODE, mode.name)
+            .putString(KEY_WIRELESS_HOTSPOT_MODE, supported.name)
             .apply()
     }
 
@@ -321,7 +332,8 @@ object AirPlayPersistence {
     fun loadOemLabel(context: Context): String =
         context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
             .getString(KEY_OEM_LABEL, DEFAULT_OEM_LABEL)
-            .orEmpty()
+            // iOS hides the car icon without a label.
+            .orEmpty().ifBlank { DEFAULT_OEM_LABEL }
 
     fun saveOemLabel(context: Context, oemLabel: String) {
         context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
@@ -334,6 +346,16 @@ object AirPlayPersistence {
             .getInt(KEY_FPS, 30),
     )
 
+    fun loadMediaBufferMillis(context: Context): Int = com.shilapi.xcertplay.media.MediaAudioBuffer.sanitize(
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            .getInt(KEY_MEDIA_BUFFER_MS, com.shilapi.xcertplay.media.MediaAudioBuffer.DEFAULT_MILLIS),
+    )
+
+    fun saveMediaBufferMillis(context: Context, millis: Int) {
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
+            .putInt(KEY_MEDIA_BUFFER_MS, com.shilapi.xcertplay.media.MediaAudioBuffer.sanitize(millis)).apply()
+    }
+
     fun saveFps(context: Context, fps: Int) {
         context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
             .putInt(KEY_FPS, AirPlayDisplaySettings.sanitizeFps(fps))
@@ -344,7 +366,7 @@ object AirPlayPersistence {
         AirPlayDisplaySettings.sanitizeWidthPhysicalMm(
             context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getInt(
                 KEY_WIDTH_PHYSICAL_MM,
-                AirPlayDisplaySettings.DEFAULT_WIDTH_PHYSICAL_MM,
+                com.shilapi.xcertplay.airplay.CarPlaySize.DEFAULT.widthMillimeters,
             ),
         )
 
@@ -384,6 +406,77 @@ object AirPlayPersistence {
         context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
             .putInt(KEY_MAX_DETECTED_WIDTH, widthPixels.coerceAtLeast(0))
             .putInt(KEY_MAX_DETECTED_HEIGHT, heightPixels.coerceAtLeast(0))
+            .apply()
+    }
+
+    fun loadClusterMapEnabled(context: Context): Boolean =
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getBoolean(KEY_CLUSTER_MAP, false)
+
+    fun saveClusterMapEnabled(context: Context, enabled: Boolean) {
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putBoolean(KEY_CLUSTER_MAP, enabled).apply()
+    }
+
+    fun loadClusterMapScalePercent(context: Context): Int = CarPlayClusterDisplay.STREAM_SCALE_PERCENT.let { default ->
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getInt(KEY_CLUSTER_MAP_SCALE, default)
+            .takeIf { it in CarPlayClusterDisplay.scalePresets } ?: default
+    }
+
+    fun saveClusterMapScalePercent(context: Context, percent: Int) {
+        if (percent !in CarPlayClusterDisplay.scalePresets) return
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putInt(KEY_CLUSTER_MAP_SCALE, percent).apply()
+    }
+
+    fun loadClusterMarkerHorizontalStep(context: Context): Int =
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getInt(KEY_CLUSTER_MARKER_X, 0)
+            .coerceIn(CarPlayClusterDisplay.horizontalSteps)
+
+    fun saveClusterMarkerHorizontalStep(context: Context, step: Int) {
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
+            .putInt(KEY_CLUSTER_MARKER_X, step.coerceIn(CarPlayClusterDisplay.horizontalSteps)).apply()
+    }
+
+    fun loadClusterMarkerVerticalStep(context: Context): Int =
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getInt(KEY_CLUSTER_MARKER_Y, 0)
+            .coerceIn(CarPlayClusterDisplay.verticalSteps)
+
+    fun saveClusterMarkerVerticalStep(context: Context, step: Int) {
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
+            .putInt(KEY_CLUSTER_MARKER_Y, step.coerceIn(CarPlayClusterDisplay.verticalSteps)).apply()
+    }
+
+    /** Largest host size seen for one bar layout and orientation; the fixed-resolution base. */
+    fun loadResolutionBase(context: Context, layout: String): PixelSize? {
+        val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        val width = prefs.getInt("$KEY_RESOLUTION_BASE_PREFIX${layout}_width", 0)
+        val height = prefs.getInt("$KEY_RESOLUTION_BASE_PREFIX${layout}_height", 0)
+        return if (width > 0 && height > 0) PixelSize(width, height) else null
+    }
+
+    fun saveResolutionBase(context: Context, layout: String, size: PixelSize) {
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
+            .putInt("$KEY_RESOLUTION_BASE_PREFIX${layout}_width", size.width.coerceAtLeast(0))
+            .putInt("$KEY_RESOLUTION_BASE_PREFIX${layout}_height", size.height.coerceAtLeast(0))
+            .apply()
+    }
+
+    /** Base and negotiated resolution of the most recent session, for settings and reports. */
+    fun loadFixedResolution(context: Context): Pair<PixelSize, PixelSize>? {
+        val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        val base = PixelSize(prefs.getInt(KEY_FIXED_BASE_WIDTH, 0), prefs.getInt(KEY_FIXED_BASE_HEIGHT, 0))
+        val fixed = PixelSize(prefs.getInt(KEY_FIXED_WIDTH, 0), prefs.getInt(KEY_FIXED_HEIGHT, 0))
+        return if (base.width > 0 && base.height > 0 && fixed.width > 0 && fixed.height > 0) {
+            base to fixed
+        } else {
+            null
+        }
+    }
+
+    fun saveFixedResolution(context: Context, base: PixelSize, fixed: PixelSize) {
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
+            .putInt(KEY_FIXED_BASE_WIDTH, base.width)
+            .putInt(KEY_FIXED_BASE_HEIGHT, base.height)
+            .putInt(KEY_FIXED_WIDTH, fixed.width)
+            .putInt(KEY_FIXED_HEIGHT, fixed.height)
             .apply()
     }
 
