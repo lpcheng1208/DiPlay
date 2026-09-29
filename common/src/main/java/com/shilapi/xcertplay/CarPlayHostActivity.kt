@@ -327,7 +327,8 @@ class CarPlayHostActivity : ComponentActivity() {
     private var activeAirPlaySession: AirPlaySession? = null
     private val activeScreenStreamTypes = mutableSetOf<Int>()
     private var handshakeResetInProgress = false
-    private var startAfterHandshakeReset = false
+    // Set when the session ends or fails while the settings overlay suppresses reconnects.
+    private var reconnectAfterSettings = false
     private var restartGeneration = 0
     private var reconnectScheduled = false
     private var sessionLog: SessionLogFile? = null
@@ -804,10 +805,16 @@ class CarPlayHostActivity : ComponentActivity() {
             setOnClickListener { showDiPlayHome() }
         }, LinearLayout.LayoutParams(dp(300), dp(64)))
         panel.addView(TextView(this).apply {
-            text = "In CarPlay, swipe down with three fingers to open DiPlay settings."
+            text = "In CarPlay, swipe down with three fingers to open CarPlay settings."
             textSize = 13f; gravity = Gravity.CENTER; setTextColor(Color.rgb(168, 182, 202)); setPadding(0, dp(20), 0, 0)
         })
         root.addView(panel, FrameLayout.LayoutParams(-1, -1))
+        val settings = buildSettingsMenu().apply { visibility = View.GONE }
+        val editor = buildSafeAreaEditor().apply { visibility = View.GONE }
+        root.addView(settings, FrameLayout.LayoutParams(-1, -1))
+        root.addView(editor, FrameLayout.LayoutParams(-1, -1))
+        settingsMenu = settings
+        safeAreaEditor = editor
         videoView = video
         gestureOverlay = gestureLayer
         stageStatusView = stage
@@ -2966,7 +2973,9 @@ class CarPlayHostActivity : ComponentActivity() {
                 runOnUiThread {
                     if (activeAirPlaySession === session) activeAirPlaySession = null
                     CarPlayBackgroundSession.active = false
-                    if (menuOpen || controllerGeneration != restartGeneration) {
+                    if (controllerGeneration != restartGeneration) return@runOnUiThread
+                    if (menuOpen) {
+                        reconnectAfterSettings = true
                         return@runOnUiThread
                     }
                     activeScreenStreamTypes.clear()
@@ -2978,7 +2987,9 @@ class CarPlayHostActivity : ComponentActivity() {
 
             override fun onTransportError(message: String) {
                 runOnUiThread {
-                    if (menuOpen || controllerGeneration != restartGeneration) {
+                    if (controllerGeneration != restartGeneration) return@runOnUiThread
+                    if (menuOpen) {
+                        reconnectAfterSettings = true
                         return@runOnUiThread
                     }
                     activeScreenStreamTypes.clear()
@@ -3008,6 +3019,9 @@ class CarPlayHostActivity : ComponentActivity() {
     private fun createStatusReporter(
         controllerGeneration: Int,
     ): (CarPlayStatus) -> Unit = { status ->
+        if (menuOpen && controllerGeneration == restartGeneration && status is CarPlayStatus.Failed) {
+            reconnectAfterSettings = true
+        }
         if (!menuOpen && controllerGeneration == restartGeneration) {
             updateHotspotStatus(status)
             val description = status.describe()
@@ -3324,6 +3338,10 @@ class CarPlayHostActivity : ComponentActivity() {
         mainHandler.postDelayed(
             {
                 reconnectScheduled = false
+                if (menuOpen && generation == restartGeneration) {
+                    reconnectAfterSettings = true
+                    return@postDelayed
+                }
                 if (
                     shuttingDown.get() ||
                     menuOpen ||
@@ -3380,7 +3398,27 @@ class CarPlayHostActivity : ComponentActivity() {
             .putExtra("page", page).addFlags(Intent.FLAG_ACTIVITY_REORDER_TO_FRONT))
     }
 
-    private fun openSettingsMenu() = showDiPlayHome("settings")
+    /**
+     * Opens the in-session settings overlay (three-finger swipe down). CarPlay keeps running
+     * underneath; only "Save and reconnect" renegotiates, Cancel leaves the session untouched.
+     */
+    private fun openSettingsMenu() {
+        val menu = settingsMenu ?: return
+        if (menuOpen || shuttingDown.get()) return
+        controller?.sendTouch(emptyList())
+        settingsBaseline = captureSettingsBaseline()
+        menuOpen = true
+        reconnectAfterSettings = false
+        gestureOverlay?.visibility = View.GONE
+        menu.visibility = View.VISIBLE
+        syncMfiSettingsControls()
+        updateManualHotspotFields()
+        updateAirPlayIconPreview()
+        updateSafeAreaSummary()
+        updateHotspotStatusBlock()
+        updateResolutionMenu()
+        appendLog("Settings opened; CarPlay session kept running")
+    }
 
     private fun saveSettingsAndReconnect() {
         if (!menuOpen) return
@@ -3388,33 +3426,71 @@ class CarPlayHostActivity : ComponentActivity() {
         if (!validateManualHotspotSettings()) return
         persistMenuSettings()
         settingsBaseline = null
-        finishSettingsMenu("Settings saved")
+        finishSettingsMenu("Settings saved", renegotiate = true)
     }
 
     private fun cancelSettingsEdits() {
         if (!menuOpen) return
         restoreSettingsBaseline()
-        finishSettingsMenu("Settings changes discarded")
+        finishSettingsMenu("Settings changes discarded", renegotiate = false)
     }
 
-    private fun finishSettingsMenu(prefix: String) {
+    private fun finishSettingsMenu(prefix: String, renegotiate: Boolean) {
         if (!menuOpen) return
+        closeSafeAreaEditor()
         menuOpen = false
         settingsMenu?.visibility = View.GONE
         gestureOverlay?.visibility = View.VISIBLE
         updateDebugOverlays()
-        logLines.clear()
-        appendLog(
-            "$prefix; starting a fresh handshake at " +
-                "${CarPlayDisplayScale.label(displayScaleTenths)} with " +
-                (if (hevcEnabled) "HEVC (H.265)" else "H.264") +
-                ", MFI ${mfiTargetLabel(mfiTarget)}" +
-                ", Wi-Fi session ${hotspotModeLabel(wirelessHotspotMode)}",
-        )
-        if (handshakeResetInProgress) {
-            startAfterHandshakeReset = true
-        } else {
-            maybeStartCarPlay()
+        val lost = reconnectAfterSettings
+        reconnectAfterSettings = false
+        when {
+            // An in-flight rebuild reads the current fields when it starts the new controller.
+            handshakeResetInProgress -> appendLog("$prefix; applying with the pending handshake reset")
+            renegotiate -> renegotiateAfterSettings(
+                "$prefix; starting a fresh handshake at " +
+                    "${CarPlayDisplayScale.label(displayScaleTenths)} with " +
+                    (if (hevcEnabled) "HEVC (H.265)" else "H.264") +
+                    ", MFI ${mfiTargetLabel(mfiTarget)}" +
+                    ", Wi-Fi session ${hotspotModeLabel(wirelessHotspotMode)}",
+            )
+            controller == null -> {
+                appendLog("$prefix; starting CarPlay")
+                maybeStartCarPlay()
+            }
+            lost -> restartCarPlay("$prefix; reconnecting a session lost while settings were open")
+            else -> appendLog("$prefix; CarPlay session unchanged")
+        }
+    }
+
+    /** Tears the session down and lets [maybeStartCarPlay] re-check prerequisites for new settings. */
+    private fun renegotiateAfterSettings(reason: String) {
+        appendLog(reason)
+        setConnectionStage("Reconnecting after settings")
+        val generation = ++restartGeneration
+        handshakeResetInProgress = true
+        controller?.sendTouch(emptyList())
+        val oldController = controller
+        val oldSink = sink
+        CarPlayBackgroundSession.clear(oldController, keepOwner = true)
+        controller = null
+        sink = null
+        activeAirPlaySession = null
+        clearFixedResolutionSession()
+        activeScreenStreamTypes.clear()
+        updateDebugOverlays()
+        teardownExecutor.execute {
+            try {
+                oldController?.close()
+                oldController?.awaitClosed(CONTROLLER_CLOSE_TIMEOUT_MILLIS)
+            } finally {
+                oldSink?.close()
+                runOnUiThread {
+                    if (shuttingDown.get() || generation != restartGeneration) return@runOnUiThread
+                    handshakeResetInProgress = false
+                    maybeStartCarPlay()
+                }
+            }
         }
     }
 

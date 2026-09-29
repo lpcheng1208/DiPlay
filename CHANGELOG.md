@@ -1,6 +1,7 @@
 # Unreleased
 
 - CarPlay keeps a fixed negotiated resolution when the car's camera or 360° surround view resizes the screen, instead of reconnecting. The video is letterboxed without distortion and touch maps to the visible CarPlay area.
+- Swiping down with three fingers in CarPlay opens the in-session settings overlay again. CarPlay keeps running while it is open; Save and reconnect applies changes with one reconnection, and closing without saving leaves the session untouched.
 - Each Resolution option is a fixed size derived from the largest screen size seen for the current bar layout; the settings page and diagnostic reports show it. Changing it applies and reconnects once.
 
 # 0.2.0 — BYD navigation and connection improvements
