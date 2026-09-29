@@ -3484,14 +3484,27 @@ class CarPlayHostActivity : ComponentActivity() {
             )
             controller == null -> {
                 appendLog("$prefix; starting CarPlay")
-                maybeStartCarPlay()
+                ensureStartupPrerequisites()
             }
             lost -> restartCarPlay("$prefix; reconnecting a session lost while settings were open")
             else -> appendLog("$prefix; CarPlay session unchanged")
         }
     }
 
-    /** Tears the session down and lets [maybeStartCarPlay] re-check prerequisites for new settings. */
+    /**
+     * Re-runs the startup prerequisite chain, which ends in [maybeStartCarPlay]. An Activity that
+     * adopted a background session skipped it in onCreate, leaving vpnReady and the microphone
+     * flag unset, so a bare maybeStartCarPlay() after a settings reconnect would never start.
+     */
+    private fun ensureStartupPrerequisites() {
+        if (microphonePermissionResolved) {
+            requestStartupPrerequisites()
+        } else {
+            microphonePermission.launch(Manifest.permission.RECORD_AUDIO)
+        }
+    }
+
+    /** Tears the session down and restarts through [ensureStartupPrerequisites] with new settings. */
     private fun renegotiateAfterSettings(reason: String) {
         appendLog(reason)
         setConnectionStage("Reconnecting after settings")
@@ -3516,7 +3529,7 @@ class CarPlayHostActivity : ComponentActivity() {
                 runOnUiThread {
                     if (shuttingDown.get() || generation != restartGeneration) return@runOnUiThread
                     handshakeResetInProgress = false
-                    maybeStartCarPlay()
+                    ensureStartupPrerequisites()
                 }
             }
         }
