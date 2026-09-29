@@ -280,6 +280,8 @@ class CarPlayHostActivity : ComponentActivity() {
     private var sessionLayout: String? = null
     private var touchOutsideContent = false
     private var displayScaleTenths = CarPlayDisplayScale.DEFAULT_TENTHS
+    // Step actually negotiated by the last createAirPlayConfig(); Native after a decoder fallback.
+    private var effectiveDisplayScaleTenths = CarPlayDisplayScale.DEFAULT_TENTHS
     private var uiScalePercent = CarPlayUiScale.DEFAULT
     private var displayDiagnosticAttempt: String? = null
     private var hevcEnabled = true
@@ -1098,7 +1100,7 @@ class CarPlayHostActivity : ComponentActivity() {
             LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f),
         )
         range.addView(
-            menuText("1.0x", 15f, MENU_SECONDARY),
+            menuText(CarPlayDisplayScale.label(CarPlayDisplayScale.MAX_TENTHS), 15f, MENU_SECONDARY),
             LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.WRAP_CONTENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT,
@@ -2716,7 +2718,33 @@ class CarPlayHostActivity : ComponentActivity() {
             heightPhysicalMm = physical.heightMm,
             fps = fps,
         )
-        val resolutionDisplay = CarPlayDisplayScale.apply(baseDisplay, displayScaleTenths)
+        var resolutionDisplay = CarPlayDisplayScale.apply(baseDisplay, displayScaleTenths)
+        effectiveDisplayScaleTenths = displayScaleTenths
+        if (displayScaleTenths > CarPlayDisplayScale.NATIVE_TENTHS) {
+            // Supersampled steps must fit the 4K bound and the head unit's decoder.
+            val upscaled = resolutionDisplay.widthPixels > baseDisplay.widthPixels
+            val upscaleSupport = if (upscaled) {
+                largerCanvasSupport(resolutionDisplay)
+            } else {
+                CanvasSupport(false, "canvas_4k_limit", "Decoder capability check skipped: canvas exceeds 4K limit")
+            }
+            appendLog(upscaleSupport.details)
+            if (!upscaleSupport.supported) {
+                appendLog(
+                    "Upscaled CarPlay resolution ${CarPlayDisplayScale.label(displayScaleTenths)} " +
+                        "${resolutionDisplay.widthPixels}x${resolutionDisplay.heightPixels} unavailable " +
+                        "reason=${upscaleSupport.reason}; using Native " +
+                        "${baseDisplay.widthPixels}x${baseDisplay.heightPixels}",
+                )
+                resolutionDisplay = baseDisplay
+                effectiveDisplayScaleTenths = CarPlayDisplayScale.NATIVE_TENTHS
+                runOnUiThread {
+                    android.widget.Toast.makeText(this,
+                        "This head unit cannot decode this resolution. Using Native.",
+                        android.widget.Toast.LENGTH_LONG).show()
+                }
+            }
+        }
         val requestedPercent = uiScalePercent
         var scaledDisplay = CarPlayUiScale.apply(resolutionDisplay, uiScalePercent)
         val candidate = scaledDisplay
@@ -3100,7 +3128,7 @@ class CarPlayHostActivity : ComponentActivity() {
         val base = resolveResolutionBase(size)
         val baseSize = DisplaySize(base.width, base.height)
         val airPlayConfig = createAirPlayConfig(baseSize)
-        val fixed = CarPlayFixedResolution.negotiated(base, displayScaleTenths)
+        val fixed = CarPlayFixedResolution.negotiated(base, effectiveDisplayScaleTenths)
         AirPlayPersistence.saveFixedResolution(this, base, fixed)
         sessionBase = base
         sessionCanvas = PixelSize(airPlayConfig.main.widthPixels, airPlayConfig.main.heightPixels)
