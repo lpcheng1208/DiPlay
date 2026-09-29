@@ -21,6 +21,8 @@ Swipe down with three fingers in CarPlay to open DiPlay settings, or return to t
 
 Start with 30 fps, Efficient video (HEVC) off and Default icon/text size. Try 80% or 60% resolution for a slower head unit. Some iPhone/head-unit combinations still ignore icon/text scaling.
 
+Each resolution option is a fixed size negotiated with the iPhone; the settings page shows it after the first connection. When the car's camera or 360° surround view resizes the screen, CarPlay keeps that resolution and is letterboxed instead of reconnecting.
+
 ## Connection recovery and reports
 
 If reinstalling left an old group, close other projection apps, then use **Settings → Wireless connection help → Reset CarPlay Wi-Fi**. DiPlay asks before removing an unrecognized Wi-Fi Direct group. Updating in place is preferable to uninstalling.

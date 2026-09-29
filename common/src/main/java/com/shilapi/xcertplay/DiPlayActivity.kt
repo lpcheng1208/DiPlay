@@ -29,6 +29,7 @@ import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
 import com.shilapi.xcertplay.airplay.CarPlayClusterDisplay
+import com.shilapi.xcertplay.airplay.CarPlayFixedResolution
 import com.shilapi.xcertplay.host.R
 import com.shilapi.xcertplay.orchestration.WirelessHotspotMode
 import java.io.File
@@ -230,7 +231,7 @@ class DiPlayActivity : ComponentActivity() {
         }
         section(content, "Display and performance", R.drawable.ic_dp_display) { card ->
             carPlaySizeControl(card)
-            choice(card, "Resolution", listOf("Native", "80% · lighter load", "60% · lightest load"), listOf(10, 8, 6).indexOf(AirPlayPersistence.loadDisplayScaleTenths(this)).coerceAtLeast(0)) { AirPlayPersistence.saveDisplayScaleTenths(this, listOf(10, 8, 6)[it]) }
+            resolutionControl(card)
             val bufferPresets = com.shilapi.xcertplay.media.MediaAudioBuffer.presets
             choice(card, "Music buffer", listOf("300 ms · default", "500 ms", "1000 ms · most stable"),
                 bufferPresets.indexOf(AirPlayPersistence.loadMediaBufferMillis(this)).coerceAtLeast(0)) {
@@ -428,6 +429,21 @@ class DiPlayActivity : ComponentActivity() {
             parent.addView(label("Turn the car’s Wi-Fi switch on. Allow Location / Nearby devices if requested and enable Location when Android asks. If playback stutters, try the built-in car hotspot at 5 GHz.", 16, MUTED))
             parent.addView(button("Open car Wi-Fi settings", false) { openCarClientWifiSettings() }, matchButton(12, 60))
         }
+    }
+
+    /** Each tier is a fixed resolution negotiated with the iPhone; screen changes keep it. */
+    private fun resolutionControl(parent: LinearLayout) {
+        val tiers = listOf(10, 8, 6)
+        val names = listOf("Native", "80% · lighter load", "60% · lightest load")
+        val base = AirPlayPersistence.loadFixedResolution(this)?.first
+        val options = tiers.mapIndexed { index, tenths ->
+            base?.let { "${names[index]} · ${CarPlayFixedResolution.negotiated(it, tenths)}" } ?: names[index]
+        }
+        val current = tiers.indexOf(AirPlayPersistence.loadDisplayScaleTenths(this)).coerceAtLeast(0)
+        choice(parent, "Resolution", options, current) { AirPlayPersistence.saveDisplayScaleTenths(this, tiers[it]) }
+        parent.addView(label("CarPlay keeps the selected resolution when the car's camera or surround view resizes the screen.", 14, MUTED).apply {
+            setPadding(0, 0, 0, dp(12))
+        })
     }
 
     private fun storedSsid() = AirPlayPersistence.loadManualHotspotSsid(this)
@@ -746,6 +762,9 @@ class DiPlayActivity : ComponentActivity() {
                     appendLine("Saved video preference (may differ from active session): ${if (AirPlayPersistence.loadHevcEnabled(appContext)) "HEVC" else "H.264"}; ${AirPlayPersistence.loadFps(appContext)} fps")
                     appendLine("CarPlay size: ${com.shilapi.xcertplay.airplay.CarPlaySize.fromWidthMillimeters(AirPlayPersistence.loadWidthPhysicalMm(appContext)).label}")
                     appendLine("Saved resolution preference (may differ from active session): ${AirPlayPersistence.loadDisplayScaleTenths(appContext) * 10}%")
+                    AirPlayPersistence.loadFixedResolution(appContext)?.let { (base, fixed) ->
+                        appendLine("Last fixed resolution: base $base -> $fixed")
+                    }
                     appendLine("Session: ${if (CarPlayBackgroundSession.active) "active" else if (CarPlayBackgroundSession.hasSession()) "connecting" else "stopped"}")
                     appendLine("Head-unit board: ${Build.BOARD}; hardware: ${Build.HARDWARE}; build: ${Build.DISPLAY}")
                     appendLine()

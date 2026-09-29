@@ -1,3 +1,8 @@
+# Unreleased
+
+- CarPlay keeps a fixed negotiated resolution when the car's camera or 360° surround view resizes the screen, instead of reconnecting. The video is letterboxed without distortion and touch maps to the visible CarPlay area.
+- Each Resolution option is a fixed size derived from the largest screen size seen for the current bar layout; the settings page and diagnostic reports show it. Changing it applies and reconnects once.
+
 # 0.2.0 — BYD navigation and connection improvements
 
 - Standalone windshield HUD arrows, distance and street names on the verified DiLink5.1 firmware; no ADB, root or computer helper.
